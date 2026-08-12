@@ -5,6 +5,7 @@ Hexagon V68 HTP (NPU).  Displays a live OpenCV window with bounding boxes,
 FPS counter (smoothed + min/max), per-frame pipeline timing, and saves a
 benchmark report on exit.
 
+![Screenshot](screenshot.png)
 ---
 
 ## Requirements
