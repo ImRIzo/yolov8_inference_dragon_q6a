@@ -17,16 +17,24 @@ void qnnCleanup();
 
 /**
  * Load a compiled context binary model and prepare for inference.
- * Populates tensor dimensions and quantization scales from the binary.
+ * Populates tensor dimensions and quantization parameters from the binary.
+ *
+ * Output dequantization follows QNN's scale-offset encoding:
+ *     float_value = (quantized_value + offset) * scale
+ * The scale/offset pairs below come from the binary's tensor metadata
+ * (authoritative), not from the config json.
  *
  * @param binPath       path to .bin context binary
  * @param cfgGraphName  graph name from config (may be empty to auto-detect)
  * @param outBoxScale   [out] dequantization scale for boxes output
+ * @param outBoxOffset  [out] dequantization offset for boxes output
  * @param outScrScale   [out] dequantization scale for scores output
+ * @param outScrOffset  [out] dequantization offset for scores output
  * @returns true on success
  */
 bool loadModel(const std::string& binPath, const std::string& cfgGraphName,
-               float& outBoxScale, float& outScrScale);
+               float& outBoxScale, int32_t& outBoxOffset,
+               float& outScrScale, int32_t& outScrOffset);
 
 /**
  * Run one inference pass.

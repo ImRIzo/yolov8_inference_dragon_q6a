@@ -19,6 +19,7 @@
 #include "preprocess.hpp"
 #include "inference.hpp"
 #include "postprocess.hpp"
+#include "evaluate.hpp"
 
 using Clock = std::chrono::steady_clock;
 using Ms    = std::chrono::duration<double, std::milli>;
@@ -119,26 +120,43 @@ int main(int argc, char** argv) {
     bool isRtsp = false;
     float confTh = DEFAULT_CONF, iouTh = DEFAULT_IOU;
     bool showOutput = true;
+    bool confGiven = false, iouGiven = false;
+    bool evalMode = false;                    // --map: mAP evaluation mode
+    std::string evalDataDir = "data/valid";   // dataset for --map
+    int numClasses = 1;
 
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "--video")  && i+1 < argc) videoPath = argv[++i];
         else if (!strcmp(argv[i], "--rtsp")   && i+1 < argc) { videoPath = argv[++i]; isRtsp = true; }
         else if (!strcmp(argv[i], "--lib")    && i+1 < argc) libDir    = argv[++i];
-        else if (!strcmp(argv[i], "--conf")   && i+1 < argc) confTh    = strtof(argv[++i], nullptr);
-        else if (!strcmp(argv[i], "--iou")    && i+1 < argc) iouTh     = strtof(argv[++i], nullptr);
+        else if (!strcmp(argv[i], "--conf")   && i+1 < argc) { confTh    = strtof(argv[++i], nullptr); confGiven = true; }
+        else if (!strcmp(argv[i], "--iou")    && i+1 < argc) { iouTh     = strtof(argv[++i], nullptr); iouGiven  = true; }
+        else if (!strcmp(argv[i], "--classes") && i+1 < argc) numClasses = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--map")) {
+            evalMode = true;
+            if (i + 1 < argc && argv[i + 1][0] != '-') evalDataDir = argv[++i];
+        }
         else if (!strcmp(argv[i], "--no-show"))               showOutput = false;
         else if (!strcmp(argv[i], "--help")) {
             printf("Usage: %s [--video PATH] [--rtsp URL] [--lib DIR] [--conf FLOAT] [--iou FLOAT]\n"
-                   "             [--no-show] [--help]\n"
+                   "             [--no-show] [--map [DATADIR]] [--classes N] [--help]\n"
                    "\n"
                    "  RTSP example:\n"
-                   "    %s --rtsp rtsp://192.168.1.100:8554/stream\n",
-                   argv[0], argv[0]);
+                   "    %s --rtsp rtsp://192.168.1.100:8554/stream\n"
+                   "\n"
+                   "  mAP evaluation on image data (YOLO labels):\n"
+                   "    %s --map data/valid\n"
+                   "    %s --map data/test --classes 1 --conf 0.001 --iou 0.7\n"
+                   "  (dataset folder must contain images/ and labels/)\n",
+                   argv[0], argv[0], argv[0], argv[0]);
         }
     }
 
-    printf("\n  Video:  %s\n  Lib:    %s\n  Conf:   %.2f  IoU: %.2f\n\n",
-           videoPath.c_str(), libDir.c_str(), confTh, iouTh);
+    if (evalMode)
+        printf("\n  Lib:        %s\n  Eval data:  %s\n\n", libDir.c_str(), evalDataDir.c_str());
+    else
+        printf("\n  Video:  %s\n  Lib:    %s\n  Conf:   %.2f  IoU: %.2f\n\n",
+               videoPath.c_str(), libDir.c_str(), confTh, iouTh);
 
     // ── ADSP ──────────────────────────────────────────────────────────────
     setenv("ADSP_LIBRARY_PATH", libDir.c_str(), 1);
@@ -149,7 +167,8 @@ int main(int argc, char** argv) {
         fprintf(stderr, "ERROR: no .bin model found\n"); return 1;
     }
     std::string graphName;
-    float boxScale = 2.5563f, scrScale = 0.0038f;
+    float boxScale = 2.5563f, scrScale = 0.0038f;   // fallbacks only
+    int32_t boxOffset = 0, scrOffset = 0;           // from model metadata
     readConfig(cfgPath, graphName, boxScale, scrScale);
     printf("Model: %s\n\n", binPath.c_str());
 
@@ -158,8 +177,28 @@ int main(int argc, char** argv) {
     if (!qnnInit(libDir)) return 1;
 
     printf("\n--- Load Model ---\n");
-    if (!loadModel(binPath, graphName, boxScale, scrScale)) {
+    if (!loadModel(binPath, graphName, boxScale, boxOffset, scrScale, scrOffset)) {
         qnnCleanup(); return 1;
+    }
+
+    // ── mAP evaluation mode (--map) ───────────────────────────────────────
+    if (evalMode) {
+        // Ultralytics val.py defaults unless the user overrides via --conf/--iou
+        if (!confGiven) confTh = 0.001f;
+        if (!iouGiven)  iouTh  = 0.7f;
+        EvalOptions eo;
+        eo.dataDir    = evalDataDir;
+        eo.numClasses = numClasses;
+        eo.confThresh = confTh;
+        eo.iouThresh  = iouTh;
+        eo.maxDet     = 300;
+        std::string dsName = evalDataDir;
+        size_t slash = dsName.rfind('/');
+        if (slash != std::string::npos) dsName = dsName.substr(slash + 1);
+        eo.reportPath = exeDir + "eval_report_" + dsName + ".txt";
+        bool ok = runEvaluation(eo, boxScale, boxOffset, scrScale, scrOffset, binPath);
+        qnnCleanup();
+        return ok ? 0 : 1;
     }
 
     // ── Open video ────────────────────────────────────────────────────────
@@ -238,7 +277,7 @@ int main(int argc, char** argv) {
         // ── Postprocess ───────────────────────────────────────────────────
         auto t4 = Clock::now();
         auto dets = parseOutputs(boxBuf, scrBuf, boxDims, scrDims,
-                                  boxScale, scrScale, confTh);
+                                  boxScale, boxOffset, scrScale, scrOffset, confTh);
         auto nd = nms(dets, confTh, iouTh);
         auto result = drawDetections(rawFrame, nd, COCO_CLASSES,
                                       pre.scale, pre.padLeft, pre.padTop);

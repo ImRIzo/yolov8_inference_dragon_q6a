@@ -19,6 +19,11 @@ if [ -f "$SRC_DIR/test_video.mp4" ]; then
     cp "$SRC_DIR/test_video.mp4" "$RELEASE/"
 fi
 
+# Image dataset (for --map evaluation)
+if [ -d "$SRC_DIR/data" ]; then
+    cp -r "$SRC_DIR/data" "$RELEASE/"
+fi
+
 # Model
 cp "$MODEL_DIR"/*.bin "$MODEL_DIR"/*_config.json "$RELEASE/model/" 2>/dev/null || true
 

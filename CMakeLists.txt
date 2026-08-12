@@ -12,7 +12,7 @@ find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs dnn highgui video
 set(QNN_INC /home/radxa/qairt/include)
 
 add_executable(yolov8_video
-    main.cpp preprocess.cpp inference.cpp postprocess.cpp)
+    main.cpp preprocess.cpp inference.cpp postprocess.cpp evaluate.cpp)
 target_include_directories(yolov8_video PRIVATE
     ${QNN_INC} ${QNN_INC}/QNN ${OpenCV_INCLUDE_DIRS})
 target_link_libraries(yolov8_video PRIVATE ${OpenCV_LIBS} dl pthread)

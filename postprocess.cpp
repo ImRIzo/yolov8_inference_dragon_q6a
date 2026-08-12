@@ -6,7 +6,9 @@ const char* COCO_CLASSES[80] = {
 
 std::vector<Detection> parseOutputs(const uint8_t* boxData, const uint8_t* scrData,
                                      const uint32_t boxDims[4], const uint32_t scrDims[4],
-                                     float boxScale, float scrScale, float confThresh) {
+                                     float boxScale, int32_t boxOffset,
+                                     float scrScale, int32_t scrOffset,
+                                     float confThresh) {
     std::vector<Detection> detections;
     int NA = (int)scrDims[2];
     int NC = (int)scrDims[1];
@@ -15,13 +17,13 @@ std::vector<Detection> parseOutputs(const uint8_t* boxData, const uint8_t* scrDa
     for (int d = 0; d < 4 && boxDims[d] > 0; d++) boxCount *= boxDims[d];
     std::vector<float> boxesFloat(boxCount);
     for (size_t i = 0; i < boxCount; i++)
-        boxesFloat[i] = (float)boxData[i] * boxScale;
+        boxesFloat[i] = (float)((int32_t)boxData[i] + boxOffset) * boxScale;
 
     size_t scrCount = 1;
     for (int d = 0; d < 4 && scrDims[d] > 0; d++) scrCount *= scrDims[d];
     std::vector<float> scoresFloat(scrCount);
     for (size_t i = 0; i < scrCount; i++)
-        scoresFloat[i] = (float)scrData[i] * scrScale;
+        scoresFloat[i] = (float)((int32_t)scrData[i] + scrOffset) * scrScale;
 
     for (int a = 0; a < NA; a++) {
         float maxScore = -1.0f;

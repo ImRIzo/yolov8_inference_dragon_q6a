@@ -199,7 +199,8 @@ void qnnCleanup() {
 }
 
 bool loadModel(const std::string& binPath, const std::string& cfgGraphName,
-               float& outBoxScale, float& outScrScale) {
+               float& outBoxScale, int32_t& outBoxOffset,
+               float& outScrScale, int32_t& outScrOffset) {
     g_mBuf = readFile(binPath);
     if (g_mBuf.empty()) return false;
     printf("  Model: %s (%zu bytes)\n", binPath.c_str(), g_mBuf.size());
@@ -282,13 +283,24 @@ bool loadModel(const std::string& binPath, const std::string& cfgGraphName,
         fprintf(stderr, "ERROR: graphRetrieve\n"); return false;
     }
 
-    // Store output scales from config (used by postprocess)
-    outBoxScale = 2.5563f;
-    outScrScale = 0.0038f;
+    // Dequantization parameters from the binary's tensor metadata:
+    //   float_value = (quantized_value + offset) * scale
+    if (g_boxOK &&
+        g_boxInfo.qp.quantizationEncoding == QNN_QUANTIZATION_ENCODING_SCALE_OFFSET) {
+        outBoxScale  = g_boxInfo.qp.scaleOffsetEncoding.scale;
+        outBoxOffset = g_boxInfo.qp.scaleOffsetEncoding.offset;
+    }
+    if (g_scrOK &&
+        g_scrInfo.qp.quantizationEncoding == QNN_QUANTIZATION_ENCODING_SCALE_OFFSET) {
+        outScrScale  = g_scrInfo.qp.scaleOffsetEncoding.scale;
+        outScrOffset = g_scrInfo.qp.scaleOffsetEncoding.offset;
+    }
 
     buildTensors();
     allocOutputBuffers();
 
+    printf("  Output dequant: boxes %.4f * (q + %d), scores %.6f * (q + %d)\n",
+           outBoxScale, outBoxOffset, outScrScale, outScrOffset);
     printf("  Model loaded on HTP\n");
     return true;
 }

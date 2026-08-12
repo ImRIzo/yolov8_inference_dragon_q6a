@@ -12,10 +12,13 @@ struct Detection {
 
 extern const char* COCO_CLASSES[80];
 
-// Parse raw QNN output tensors into detections
+// Parse raw QNN output tensors into detections.
+// Dequantization: float_value = (quantized_value + offset) * scale
 std::vector<Detection> parseOutputs(const uint8_t* boxData, const uint8_t* scrData,
                                      const uint32_t boxDims[4], const uint32_t scrDims[4],
-                                     float boxScale, float scrScale, float confThresh);
+                                     float boxScale, int32_t boxOffset,
+                                     float scrScale, int32_t scrOffset,
+                                     float confThresh);
 
 // Non-maximum suppression
 std::vector<Detection> nms(const std::vector<Detection>& dets,
