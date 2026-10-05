@@ -1,0 +1,6 @@
+# YOLOv8 CPU inference (onnxruntime) — direct dependencies only.
+# Tested with Python 3.12 on Radxa Dragon Q6A / Ubuntu 24.04 (aarch64).
+# Python 3.10+ supported. Install with:  pip install -r requirements.txt
+onnxruntime>=1.26.0      # CPU inference session (CPUExecutionProvider)
+numpy>=1.24.0            # blob conversion, NMS ordering, mAP math
+opencv-python>=4.8.0     # capture, letterbox, NMSBoxes, display (import cv2)

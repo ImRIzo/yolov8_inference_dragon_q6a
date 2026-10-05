@@ -1,0 +1,42 @@
+============================================================
+  YOLOv8 Evaluation Report (COCO-style mAP) - CPU
+============================================================
+  Date:            2026-10-05 19:37:34
+  Dataset:         /home/radxa/src/Ganoderma Research/genoderma_train/data/valid
+  Model:           /home/radxa/src/inference_cpu/best.onnx
+  Images:          104
+  GT boxes:        126
+  Predictions:     1259
+  Conf: 0.001   NMS IoU: 0.70   Classes: 1   Max det: 300
+------------------------------------------------------------
+  mAP@0.5          0.8188
+  mAP@0.5:0.95     0.5271
+  Precision        0.6918
+  Recall           0.8016
+  F1-score         0.7426
+  Best conf        0.509   (operating point of P/R/F1)
+------------------------------------------------------------
+  AP per IoU threshold:
+    IoU      AP
+    0.50    0.8188
+    0.55    0.8062
+    0.60    0.7794
+    0.65    0.7491
+    0.70    0.7303
+    0.75    0.6208
+    0.80    0.4637
+    0.85    0.2422
+    0.90    0.0598
+    0.95    0.0004
+------------------------------------------------------------
+  Per class:
+    Class              Img    GT    AP50    AP50-95   Prec    Rec     F1
+    Ganoderma          63    126   0.8188   0.5271   0.6918  0.8016  0.7426
+------------------------------------------------------------
+  Timing:
+    Total:           25.9 s   (4.0 images/s)
+    Avg preprocess:  2.4 ms
+    Avg inference:   240.6 ms
+    Avg postprocess: 0.1 ms
+    Avg total:       243.1 ms
+============================================================
