@@ -20,6 +20,7 @@ Usage examples:
     python3 yolov8_cpu.py --video test_video.mp4 --no-show
     python3 yolov8_cpu.py --rtsp rtsp://192.168.1.100:8554/stream
     python3 yolov8_cpu.py --image photo.jpg
+    python3 yolov8_cpu.py --eval --images data/test/images --labels data/test/labels
     python3 yolov8_cpu.py --map data/valid
     python3 yolov8_cpu.py --map data/test --classes 1 --conf 0.001 --iou 0.7
 
@@ -27,7 +28,9 @@ Controls: ESC / q / Q quits and saves the report.
 """
 
 import argparse
+import csv
 import os
+import subprocess
 import sys
 import time
 
@@ -556,97 +559,196 @@ def smooth_box(y, frac):
 
 
 def run_eval(args, model, names, script_dir):
-    data_dir = args.map
-    img_dir = os.path.join(data_dir, "images")
-    lbl_dir = os.path.join(data_dir, "labels")
-    image_files = sorted(f for f in os.listdir(img_dir)
-                         if not f.startswith(".")
-                         and f.lower().endswith(IMG_EXTS))
+    """Static labeled-image evaluation — same flow as the C++ yolov8_video --eval.
+
+    Runs the ONNX model on CPU over every image of a dataset, saves the raw
+    detections (after NMS + reverse letterbox) to predictions.csv together
+    with audit files, computes the built-in COCO-style metrics, and hands the
+    predictions to evaluate_metrics.py for the Ultralytics-exact numbers
+    (evaluation_results.csv).
+    """
+    # ── Resolve dataset directories (--images/--labels or legacy --map) ─────
+    if args.images:
+        img_dir = args.images
+        img_parent = os.path.dirname(img_dir.rstrip("/"))
+        lbl_dir = args.labels or os.path.join(img_parent, "labels")
+        ds_name = os.path.basename(img_parent) or "dataset"
+    else:
+        data_dir = args.map or "data/valid"
+        img_dir = os.path.join(data_dir, "images")
+        lbl_dir = os.path.join(data_dir, "labels")
+        ds_name = os.path.basename(data_dir.rstrip("/")) or "dataset"
+
+    out_dir = args.out or script_dir
+    os.makedirs(out_dir, exist_ok=True)
+    pred_csv  = os.path.join(out_dir, "predictions.csv")
+    size_csv  = os.path.join(out_dir, "image_sizes.csv")
+    cfg_csv   = os.path.join(out_dir, "eval_config.csv")
+    img_list  = os.path.join(out_dir, "evaluated_images.txt")
+    res_csv   = os.path.join(out_dir, "evaluation_results.csv")
+    report_path = os.path.join(out_dir, f"eval_report_{ds_name}.txt")
+
+    # ── Error checks ─────────────────────────────────────────────────────────
+    if not os.path.isdir(img_dir):
+        print(f"ERROR: image directory does not exist: {img_dir}", file=sys.stderr)
+        return 1
+    if not os.path.isdir(lbl_dir):
+        print(f"ERROR: labels directory does not exist: {lbl_dir}", file=sys.stderr)
+        return 1
+
+    all_files = sorted(f for f in os.listdir(img_dir) if not f.startswith("."))
+    image_files = [f for f in all_files if f.lower().endswith(IMG_EXTS)]
+    unsupported = [f for f in all_files
+                   if not f.lower().endswith(IMG_EXTS)
+                   and os.path.isfile(os.path.join(img_dir, f))]
+    for f in unsupported:
+        print(f"WARN: unsupported image type in {img_dir} — skipped: {f}",
+              file=sys.stderr)
     if not image_files:
-        print(f"ERROR: no images found in {img_dir}", file=sys.stderr)
+        print(f"ERROR: no images (.jpg/.jpeg/.png/.bmp/.webp) found in {img_dir}",
+              file=sys.stderr)
         return 1
 
     num_classes = args.classes if args.classes is not None else model.num_classes
+    conf, iou = args.conf, args.iou
+    max_det = args.max_det
+    warmup = max(0, min(args.warmup, len(image_files) - 1))
+    runtime = f"ONNX CPU (onnxruntime {ort.__version__}, CPUExecutionProvider)"
 
     print("\n============================================================")
-    print("  YOLOv8 Evaluation - COCO-style mAP (CPU)")
+    print("  ONNX CPU STATIC DETECTION EVALUATION")
     print("============================================================")
-    print(f"  Dataset:   {data_dir}")
-    print(f"  Images:    {len(image_files)}")
-    print(f"  Model:     {os.path.abspath(model.model_path)}")
-    print(f"  Conf: {args.conf:.3f}   NMS IoU: {args.iou:.2f}   "
-          f"Classes: {num_classes}   Max det: 300")
+    print(f"  Runtime/backend    : {runtime}")
+    print(f"  Model (onnx)       : {os.path.abspath(model.model_path)}")
+    print(f"  Images directory   : {img_dir}   ({len(image_files)} images)")
+    print(f"  Labels directory   : {lbl_dir}")
+    print(f"  Input resolution   : {model.imgsz}x{model.imgsz}  "
+          f"(tensor 1x3x{model.imgsz}x{model.imgsz})")
+    print(f"  Classes            : {num_classes}")
+    print(f"  Conf retention     : {conf:.3f}")
+    print(f"  NMS IoU            : {iou:.2f}")
+    print(f"  Max detections     : {max_det}")
+    print(f"  Warm-up images     : {warmup} (excluded from timing, kept in accuracy)")
+    print(f"  Output directory   : {out_dir}")
     print("------------------------------------------------------------")
 
+    pcsv = open(pred_csv, "w", newline="")
+    pw = csv.writer(pcsv)
+    pw.writerow(["image", "class_id", "confidence", "x1", "y1", "x2", "y2"])
+    scsv = open(size_csv, "w", newline="")
+    sw = csv.writer(scsv)
+    sw.writerow(["image", "width", "height"])
+    ilw = open(img_list, "w")
+
     images = []
-    total_gt = total_preds = done = 0
-    total_pre = total_inf = total_post = 0.0
+    total_gt = total_preds = done = skipped = missing_labels = 0
+    pre_times, inf_times, post_times, tot_times = [], [], [], []
     start_all = time.perf_counter()
 
     for idx, fname in enumerate(image_files, 1):
         raw = cv2.imread(os.path.join(img_dir, fname))
         if raw is None:
-            print(f"WARN: cannot read {fname} - skipped", file=sys.stderr)
+            print(f"WARN: cannot read image {fname} — skipped", file=sys.stderr)
+            skipped += 1
             continue
         img = {"name": fname, "w": raw.shape[1], "h": raw.shape[0], "gt": []}
 
+        # ── Ground truth (YOLO txt: "cls cx cy w h", normalized) ─────────────
         lbl_path = os.path.join(lbl_dir, os.path.splitext(fname)[0] + ".txt")
         if not os.path.isfile(lbl_path):
-            print(f"WARN: no label file {lbl_path} - treated as empty", file=sys.stderr)
+            missing_labels += 1       # valid empty-image case: no objects
         else:
             with open(lbl_path) as lf:
-                for line in lf:
+                for lineno, line in enumerate(lf, 1):
                     parts = line.split()
+                    if not parts:
+                        continue
                     if len(parts) < 5:
+                        print(f"WARN: malformed label {lbl_path}:{lineno} "
+                              f"({line.strip()!r}) — ignored", file=sys.stderr)
                         continue
-                    cls = int(float(parts[0]))
-                    cx, cy, w, h = map(float, parts[1:5])
-                    if not (0 <= cls < num_classes) or w <= 0 or h <= 0:
+                    try:
+                        cls = int(float(parts[0]))
+                        cx, cy, w, h = map(float, parts[1:5])
+                    except ValueError:
+                        print(f"WARN: malformed label {lbl_path}:{lineno} "
+                              f"({line.strip()!r}) — ignored", file=sys.stderr)
                         continue
-                    x1 = max(0.0, (cx - w / 2) * img["w"])
-                    y1 = max(0.0, (cy - h / 2) * img["h"])
-                    x2 = min(img["w"], (cx + w / 2) * img["w"])
-                    y2 = min(img["h"], (cy + h / 2) * img["h"])
+                    if cls < 0 or cls >= num_classes:
+                        print(f"WARN: class id {cls} out of range [0,{num_classes}) "
+                              f"in {lbl_path}:{lineno} — ignored", file=sys.stderr)
+                        continue
+                    if w <= 0 or h <= 0:
+                        print(f"WARN: non-positive box size in {lbl_path}:{lineno} "
+                              f"— ignored", file=sys.stderr)
+                        continue
+                    # normalized -> original pixel xyxy (no clipping, like val.py)
+                    x1 = (cx - w / 2) * img["w"]
+                    y1 = (cy - h / 2) * img["h"]
+                    x2 = (cx + w / 2) * img["w"]
+                    y2 = (cy + h / 2) * img["h"]
                     img["gt"].append((cls, x1, y1, x2, y2))
         total_gt += len(img["gt"])
 
+        # ── Pipeline: preprocess / CPU inference / postprocess ───────────────
         t0 = time.perf_counter()
         blob, scale, pad_left, pad_top = model.preprocess(raw)
         t1 = time.perf_counter()
         outs = model.infer(blob)
         t2 = time.perf_counter()
-        dets = nms(model.parse_outputs(outs, args.conf), args.conf, args.iou)
+        dets = nms(model.parse_outputs(outs, conf), conf, iou)
         t3 = time.perf_counter()
-        pre_ms = (t1 - t0) * 1000
-        inf_ms = (t2 - t1) * 1000
+        pre_ms = (t1 - t0) * 1000.0
+        inf_ms = (t2 - t1) * 1000.0
+        post_ms = (t3 - t2) * 1000.0
 
         dets.sort(key=lambda d: -d[4])
-        dets = dets[:300]                      # max det (COCO convention)
+        dets = dets[:max_det]               # max detections (COCO/Ultralytics)
 
+        # ── Reverse letterbox with the EXACT resize dimensions ───────────────
+        # (x - pad) * origW / resizedW — same as the C++ tool; no clipping,
+        # matching Ultralytics scale_boxes.
+        w_img, h_img = img["w"], img["h"]
+        nw, nh = int(w_img * scale), int(h_img * scale)
+        inv_x = (w_img / nw) if nw else 1.0 / scale
+        inv_y = (h_img / nh) if nh else 1.0 / scale
         preds = []
-        for x1, y1, x2, y2, conf, cls in dets:
-            preds.append((max(0.0, min(img["w"], (x1 - pad_left) / scale)),
-                          max(0.0, min(img["h"], (y1 - pad_top) / scale)),
-                          max(0.0, min(img["w"], (x2 - pad_left) / scale)),
-                          max(0.0, min(img["h"], (y2 - pad_top) / scale)),
-                          conf, cls))
+        for x1, y1, x2, y2, conf_, cls in dets:
+            px1 = (x1 - pad_left) * inv_x
+            py1 = (y1 - pad_top) * inv_y
+            px2 = (x2 - pad_left) * inv_x
+            py2 = (y2 - pad_top) * inv_y
+            preds.append((px1, py1, px2, py2, conf_, cls))
+            pw.writerow([fname, cls, conf_, px1, py1, px2, py2])
         img["preds"] = preds
         total_preds += len(preds)
+        sw.writerow([fname, img["w"], img["h"]])
+        ilw.write(fname + "\n")
+
+        # ── Timing (warm-up excluded) ────────────────────────────────────────
+        timed = (idx - 1) >= warmup
+        if timed:
+            pre_times.append(pre_ms)
+            inf_times.append(inf_ms)
+            post_times.append(post_ms)
+            tot_times.append(pre_ms + inf_ms + post_ms)
         done += 1
-        post_ms = (time.perf_counter() - t3) * 1000
-        total_pre += pre_ms
-        total_inf += inf_ms
-        total_post += post_ms
 
         print(f"  [{done:3d}/{len(image_files)}] {fname:<52s} gt:{len(img['gt']):2d} "
-              f"det:{len(preds):3d}  {pre_ms:.1f}/{inf_ms:.1f}/{post_ms:.1f} ms")
+              f"det:{len(preds):3d}  {pre_ms:.1f}/{inf_ms:.1f}/{post_ms:.1f} ms"
+              + ("" if timed else "  (warm-up)"))
         images.append(img)
+
+    pcsv.close()
+    scsv.close()
+    ilw.close()
+    wall_sec = time.perf_counter() - start_all
 
     if not images:
         print("ERROR: no images were processed", file=sys.stderr)
         return 1
 
-    # ── Per-class GT stats ──
+    # ── Per-class GT stats ───────────────────────────────────────────────────
     gt_count = np.zeros(num_classes, dtype=int)
     img_count = np.zeros(num_classes, dtype=int)
     for img in images:
@@ -657,7 +759,7 @@ def run_eval(args, model, names, script_dir):
         for c in seen:
             img_count[c] += 1
 
-    # ── AP per class per IoU threshold ──
+    # ── AP per class per IoU threshold ───────────────────────────────────────
     ap = np.zeros((NUM_IOU_THRESH, num_classes))
     for t in range(NUM_IOU_THRESH):
         thr = 0.5 + 0.05 * t
@@ -673,7 +775,7 @@ def run_eval(args, model, names, script_dir):
     ap50c = ap[0]
     ap5095c = ap.mean(axis=0)
 
-    # ── P / R / F1 at IoU 0.5, max-F1 operating point ──
+    # ── P / R / F1 at IoU 0.5, max-F1 operating point (built-in) ─────────────
     per_class = gather_matches(images, 0.5, num_classes)
     pc, rc, fc = np.zeros(num_classes), np.zeros(num_classes), np.zeros(num_classes)
     best_conf = 0.0
@@ -691,28 +793,62 @@ def run_eval(args, model, names, script_dir):
     R = float(rc[valid].mean()) if valid else 0.0
     F1 = float(fc[valid].mean()) if valid else 0.0
 
-    # ── Report ──
-    total_sec = time.perf_counter() - start_all
-    avg_pre = total_pre / done if done else 0.0
-    avg_inf = total_inf / done if done else 0.0
-    avg_post = total_post / done if done else 0.0
-    img_per_s = done / total_sec if total_sec > 0 else 0.0
+    # ── Timing statistics (warm-up excluded) ─────────────────────────────────
+    def time_stats(v):
+        if not v:
+            return (0.0, 0.0, 0.0, 0.0)
+        a = np.asarray(v)
+        return (float(a.mean()), float(a.std()), float(a.min()), float(a.max()))
+
+    s_pre, s_inf, s_post, s_tot = (time_stats(v) for v in
+                                   (pre_times, inf_times, post_times, tot_times))
+    timed_n = len(pre_times)
+    img_per_s = done / wall_sec if wall_sec > 0 else 0.0
 
     def name_of(c):
         return names[c] if c < len(names) else f"class_{c}"
 
+    # ── eval_config.csv (audit metadata for evaluate_metrics.py) ─────────────
+    with open(cfg_csv, "w", newline="") as cf:
+        cw = csv.writer(cf)
+        cw.writerow(["key", "value"])
+        for k, v in [
+            ("model/runtime", runtime),
+            ("model_path", os.path.abspath(model.model_path)),
+            ("runtime/backend", runtime),
+            ("input_resolution", f"{model.imgsz}x{model.imgsz}"),
+            ("num_classes", str(num_classes)),
+            ("num_images", str(done)),
+            ("ground_truth_boxes", str(total_gt)),
+            ("predicted_boxes", str(total_preds)),
+            ("confidence_retention_threshold", f"{conf:.4f}"),
+            ("nms_iou", f"{iou:.4f}"),
+            ("max_det", str(max_det)),
+            ("warmup_frames", str(warmup)),
+            ("images_dir", img_dir),
+            ("labels_dir", lbl_dir),
+            ("date", time.strftime("%Y-%m-%d %H:%M:%S")),
+        ]:
+            cw.writerow([k, v])
+
+    # ── Report ───────────────────────────────────────────────────────────────
     L = []
     L.append("============================================================")
-    L.append("  YOLOv8 Evaluation Report (COCO-style mAP) - CPU")
+    L.append("  YOLOv8 Evaluation Report (COCO-style mAP) - ONNX CPU")
     L.append("============================================================")
     L.append(f"  Date:            {time.strftime('%Y-%m-%d %H:%M:%S')}")
-    L.append(f"  Dataset:         {data_dir}")
+    L.append(f"  Runtime/backend: {runtime}")
+    L.append(f"  Dataset:         {img_dir}")
+    L.append(f"  Labels:          {lbl_dir}")
     L.append(f"  Model:           {os.path.abspath(model.model_path)}")
+    L.append(f"  Input:           1x3x{model.imgsz}x{model.imgsz}")
+    L.append(f"  Outputs:         {model.out_names}")
     L.append(f"  Images:          {done}")
     L.append(f"  GT boxes:        {total_gt}")
     L.append(f"  Predictions:     {total_preds}")
-    L.append(f"  Conf: {args.conf:.3f}   NMS IoU: {args.iou:.2f}   "
-             f"Classes: {num_classes}   Max det: 300")
+    L.append(f"  Conf: {conf:.3f}   NMS IoU: {iou:.2f}   "
+             f"Classes: {num_classes}   Max det: {max_det}")
+    L.append(f"  Warm-up images:  {warmup} (excluded from timing, kept in accuracy)")
     L.append("------------------------------------------------------------")
     L.append(f"  mAP@0.5          {map50:.4f}")
     L.append(f"  mAP@0.5:0.95     {map5095:.4f}")
@@ -735,21 +871,90 @@ def run_eval(args, model, names, script_dir):
                  f"{ap50c[c]:6.4f}   {ap5095c[c]:6.4f}   "
                  f"{pc[c]:6.4f}  {rc[c]:6.4f}  {fc[c]:6.4f}")
     L.append("------------------------------------------------------------")
-    L.append("  Timing:")
-    L.append(f"    Total:           {total_sec:.1f} s   ({img_per_s:.1f} images/s)")
-    L.append(f"    Avg preprocess:  {avg_pre:.1f} ms")
-    L.append(f"    Avg inference:   {avg_inf:.1f} ms")
-    L.append(f"    Avg postprocess: {avg_post:.1f} ms")
-    L.append(f"    Avg total:       {avg_pre + avg_inf + avg_post:.1f} ms")
+    L.append("  Timing (warm-up excluded; std = population stddev):")
+    L.append(f"    Images timed:      {timed_n}")
+    L.append(f"    Total:             {wall_sec:.3f} s   ({img_per_s:.1f} images/s, {done} images)")
+    L.append("                        mean       std       min       max")
+    L.append(f"    preprocess  (ms) {s_pre[0]:8.3f}  {s_pre[1]:8.3f}  {s_pre[2]:8.3f}  {s_pre[3]:8.3f}")
+    L.append(f"    ONNX inference(ms){s_inf[0]:8.3f}  {s_inf[1]:8.3f}  {s_inf[2]:8.3f}  {s_inf[3]:8.3f}")
+    L.append(f"    postprocess (ms) {s_post[0]:8.3f}  {s_post[1]:8.3f}  {s_post[2]:8.3f}  {s_post[3]:8.3f}")
+    L.append(f"    total       (ms) {s_tot[0]:8.3f}  {s_tot[1]:8.3f}  {s_tot[2]:8.3f}  {s_tot[3]:8.3f}")
+    if skipped:
+        L.append(f"  Skipped (unreadable): {skipped}")
+    if missing_labels:
+        L.append(f"  Images without label file (treated as empty): {missing_labels}")
+    L.append("------------------------------------------------------------")
+    L.append(f"  Files: {pred_csv}")
+    L.append(f"         {size_csv}")
+    L.append(f"         {cfg_csv}")
+    L.append(f"         {img_list}")
+    L.append("------------------------------------------------------------")
+    L.append("  Evaluated image files:")
+    for img in images:
+        L.append("    " + img["name"])
     L.append("============================================================")
     rep = "\n".join(L) + "\n"
 
-    ds_name = os.path.basename(data_dir.rstrip("/")) or "dataset"
-    report_path = os.path.join(script_dir, f"eval_report_{ds_name}.txt")
     with open(report_path, "w") as f:
         f.write(rep)
     print(rep)
     print(f"Report saved: {report_path}")
+
+    # ── Final console summary (same format as the C++ tool) ─────────────────
+    print("\n============================================================")
+    print("ONNX CPU STATIC DETECTION EVALUATION")
+    print("============================================================")
+    print(f"Images              : {done}")
+    print(f"Ground-truth boxes  : {total_gt}")
+    print(f"Predicted boxes     : {total_preds}")
+    print()
+    print(f"mAP@0.5              : {map50:.4f}")
+    print(f"mAP@0.5:0.95         : {map5095:.4f}")
+    print(f"Precision            : {P:.4f}")
+    print(f"Recall               : {R:.4f}")
+    print(f"F1                   : {F1:.4f}")
+    print()
+    print(f"Prediction threshold : {conf:.3f}")
+    print(f"NMS IoU              : {iou:.2f}")
+    print(f"Max detections       : {max_det}")
+    print()
+    print("(Built-in COCO 101-point metrics above; the canonical")
+    print(" Ultralytics-exact numbers are printed by evaluate_metrics.py)")
+    print()
+    print(f"--- Timing ({warmup} warm-up excluded, {timed_n} timed images) ---")
+    print("                       mean       std       min       max")
+    print(f"  preprocess  (ms) {s_pre[0]:8.3f}  {s_pre[1]:8.3f}  {s_pre[2]:8.3f}  {s_pre[3]:8.3f}")
+    print(f"  ONNX inference(ms){s_inf[0]:8.3f}  {s_inf[1]:8.3f}  {s_inf[2]:8.3f}  {s_inf[3]:8.3f}")
+    print(f"  postprocess (ms) {s_post[0]:8.3f}  {s_post[1]:8.3f}  {s_post[2]:8.3f}  {s_post[3]:8.3f}")
+    print(f"  total       (ms) {s_tot[0]:8.3f}  {s_tot[1]:8.3f}  {s_tot[2]:8.3f}  {s_tot[3]:8.3f}")
+    print()
+    print(f"  Total images      : {done}")
+    print(f"  Total processing  : {wall_sec:.3f} s")
+    print(f"  Images/second     : {img_per_s:.2f}")
+    print("============================================================")
+
+    print(f"\nSaved:\n  {pred_csv}\n  {size_csv}\n  {cfg_csv}\n  {img_list}\n  {report_path}")
+
+    # ── Ultralytics-exact metrics via evaluate_metrics.py ────────────────────
+    evaluator = os.path.join(script_dir, "evaluate_metrics.py")
+    if not os.path.isfile(evaluator):
+        evaluator = os.path.join(script_dir, "..", "evaluate_metrics.py")
+    if os.path.isfile(evaluator):
+        cmd = [sys.executable, evaluator,
+               "--predictions", pred_csv,
+               "--labels", lbl_dir,
+               "--images", img_dir,
+               "--sizes", size_csv,
+               "--config", cfg_csv,
+               "--output", res_csv]
+        print("\n--- Ultralytics-exact metrics (evaluate_metrics.py) ---")
+        rc = subprocess.call(cmd)
+        if rc:
+            print(f"\nNOTE: evaluate_metrics.py exited with code {rc} — rerun manually:\n  "
+                  + " ".join(cmd))
+    else:
+        print("\nNOTE: evaluate_metrics.py not found — run it manually with "
+              "--predictions/--labels/--images/--sizes/--config/--output")
     return 0
 
 
@@ -792,11 +997,26 @@ def main(argv=None):
                     help=f"NMS IoU threshold (default: {DEFAULT_IOU:.2f})")
     ap.add_argument("--map", nargs="?", const="data/valid", default=None,
                     metavar="DATADIR",
-                    help="Run COCO-style mAP evaluation on a dataset "
-                         "(images/ + labels/, YOLO txt). Default dataset: data/valid")
+                    help="Legacy: evaluate a dataset dir containing images/ + "
+                         "labels/ (YOLO txt). Default dataset: data/valid")
+    ap.add_argument("--eval", action="store_true",
+                    help="Static labeled-image evaluation mode (saves "
+                         "predictions.csv and runs evaluate_metrics.py)")
+    ap.add_argument("--images", default=None,
+                    help="Test images directory (implies --eval)")
+    ap.add_argument("--labels", default=None,
+                    help="YOLO txt labels directory (default: ../labels next "
+                         "to the images directory)")
+    ap.add_argument("--out", default=None,
+                    help="Output directory for predictions.csv, reports, CSVs "
+                         "(default: script directory)")
+    ap.add_argument("--max-det", type=int, default=300,
+                    help="Max detections kept per image (default: 300)")
+    ap.add_argument("--warmup", type=int, default=5,
+                    help="Warm-up images excluded from timing stats (default: 5)")
     ap.add_argument("--classes", type=int, default=None,
                     help="Number of model classes (default: auto from ONNX; "
-                         "used with --map)")
+                         "used with --eval/--map)")
     ap.add_argument("--no-show", dest="show", action="store_false",
                     help="Disable display window (benchmark mode)")
     ap.set_defaults(show=True)
@@ -815,7 +1035,8 @@ def main(argv=None):
     iou_given = args.iou is not None
     args.conf = args.conf if conf_given else DEFAULT_CONF
     args.iou = args.iou if iou_given else DEFAULT_IOU
-    if args.map:                                # Ultralytics val.py defaults
+    eval_mode = bool(args.map) or args.eval or bool(args.images)
+    if eval_mode:                               # Ultralytics val.py defaults
         args.conf = args.conf if conf_given else 0.001
         args.iou = args.iou if iou_given else 0.7
 
@@ -825,7 +1046,7 @@ def main(argv=None):
     print(f"  Outputs: {model.out_names}")
     print(f"  Conf: {args.conf:.3f}  IoU: {args.iou:.2f}\n")
 
-    if args.map:
+    if eval_mode:
         return run_eval(args, model, names, script_dir)
     if args.image:
         return run_image(args, model, names, script_dir)

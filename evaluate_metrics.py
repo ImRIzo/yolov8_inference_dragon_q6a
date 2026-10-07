@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-evaluate_metrics.py — Ultralytics-exact detection metrics for QNN predictions.
+evaluate_metrics.py — Ultralytics-exact detection metrics for saved predictions.
 
 Computes mAP@0.5, mAP@0.5:0.95, Precision, Recall and F1 from the raw
-predictions saved by `yolov8_video --eval` (predictions.csv) and the
-YOLO-format ground-truth labels.  The computation mirrors Ultralytics
-8.4.45 val.py EXACTLY (verified against the installed source):
+predictions saved by `yolov8_video --eval` (QNN/NPU) or
+`yolov8_cpu.py --eval` (ONNX CPU) — both write the same predictions.csv —
+and the YOLO-format ground-truth labels.  The computation mirrors
+Ultralytics 8.4.45 val.py EXACTLY (verified against the installed source):
 
   * per-image greedy matching   : BaseValidator.match_predictions()
   * AP via 101-point interp PR  : utils.metrics.compute_ap()
@@ -424,7 +425,7 @@ def main(argv=None):
     lines = []
     add = lines.append
     add("============================================================")
-    add("QNN HTP NPU STATIC DETECTION EVALUATION (Ultralytics-exact)")
+    add("STATIC DETECTION EVALUATION (Ultralytics-exact)")
     add("============================================================")
     add(f"  Runtime/backend   : {runtime}")
     add(f"  Images            : {num_images}")

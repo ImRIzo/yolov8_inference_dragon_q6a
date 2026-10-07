@@ -98,37 +98,80 @@ PYENV_VERSION=py312 python3 yolov8_cpu.py --help
 Detections are printed to the console and the annotated image is saved as
 `result_photo.jpg`.
 
-### mAP evaluation on image data
+### Static labeled-image evaluation (accuracy)
 
-Runs the same CPU pipeline on every image of a dataset and computes
-COCO/Ultralytics-style metrics against the YOLO-format labels.  One
-dataset per run — run all three splits like this:
+Runs the same CPU pipeline on every image of a labeled test set, saves the
+raw detections and computes Ultralytics-exact metrics — the same flow as
+the C++ NPU tool (`yolov8_video --eval`), so both runtimes can be compared
+through the identical metric pipeline.
+
+**Test-set evaluation — exact copy-paste command:**
 
 ```bash
-./run.sh --map data/train --names Ganoderma
-./run.sh --map data/valid --names Ganoderma
-./run.sh --map data/test --names Ganoderma --conf 0.001 --iou 0.7
+cd inference_cpu_python
+
+./run.sh --eval --images ../data/test/images --labels ../data/test/labels \
+    --out ../results/cpu/test
 ```
 
-(with `data/` being the ganoderma dataset from `Ganoderma Research/
-genoderma_train/data/`, or a symlink to it.)
+(with `../data/` being the dataset folder next to the repository root.)
 
-`--map` without a dataset defaults to `data/valid`.  The dataset folder must
-contain `images/` (jpg/png/bmp/webp) and `labels/` (YOLO txt: one line per
-box, `class cx cy w h`, normalized).  Evaluation defaults to `conf 0.001` /
-`iou 0.7` / `max_det 300` (Ultralytics val.py defaults) unless `--conf` /
-`--iou` are given.
+Evaluation settings default to **Ultralytics val.py values**: conf `0.001`,
+NMS IoU `0.70`, max detections `300`, 5 warm-up images (warm-up predictions
+still count for accuracy, only their timings are excluded).  The pipeline
+per image:
 
-Metrics (same conventions as Ultralytics):
+```
+letterbox 640x640 → ONNX CPU inference → YOLO decode → NMS → max-det cap →
+reverse letterbox back to original image pixels
+```
 
-- **mAP@0.5** — AP at IoU 0.5
-- **mAP@0.5:0.95** — mean AP over 10 IoU thresholds (0.50…0.95, step 0.05)
-- **Precision / Recall / F1** — at the max-F1 operating point
-- AP uses 101-point interpolated precision-recall curves
+Every run writes, into the output directory (`--out`, default: script dir):
 
-The full report (per-IoU-threshold AP table, per-class table, pipeline
-timing) is printed and saved to `eval_report_<dataset>.txt` next to the
-script (e.g. `eval_report_valid.txt`).
+| File | Content |
+|---|---|
+| `predictions.csv` | Raw detections after NMS + reverse letterbox: `image,class_id,confidence,x1,y1,x2,y2` (full float precision) |
+| `image_sizes.csv` | `image,width,height` for every evaluated image |
+| `eval_config.csv` | Runtime/backend, model path, input resolution, thresholds, max_det, warm-up, dataset dirs, date |
+| `evaluated_images.txt` | Exact filenames evaluated |
+| `eval_report_<dataset>.txt` | Full report: metrics, per-IoU AP table, per-class table, timing (mean/std/min/max), filename list |
+| `evaluation_results.csv` | Final metrics table (written by `evaluate_metrics.py`) |
+
+### Ultralytics-exact metrics (evaluate_metrics.py)
+
+The script prints its own built-in COCO-style metrics, but the canonical
+numbers for the FP32-vs-INT8 comparison come from the shared
+`evaluate_metrics.py` (repo root), which reproduces **Ultralytics 8.4.45
+val.py exactly** (same matching, `ap_per_class`, 101-point AP, max-F1
+operating point).  It is run automatically at the end of `--eval`, or
+manually anytime without re-running inference:
+
+```bash
+python3 ../evaluate_metrics.py \
+    --predictions ../results/cpu/test/predictions.csv \
+    --labels ../data/test/labels \
+    --images ../data/test/images \
+    --sizes ../results/cpu/test/image_sizes.csv \
+    --config ../results/cpu/test/eval_config.csv \
+    --output ../results/cpu/test/evaluation_results.csv
+```
+
+### FP32 vs INT8 ONNX
+
+This script runs **any ONNX** via onnxruntime's CPUExecutionProvider:
+the bundled FP32 `best.onnx`, or an INT8 QDQ ONNX quantized with the
+standard `onnxruntime.quantization` tool (QNN-specific quantized
+artifacts/`.bin` files are not loadable here — those go through the C++
+NPU tool).
+
+### Legacy `--map` mode
+
+`--map DATADIR` still works for dataset folders containing `images/` +
+`labels/` and behaves like `--eval` without the CSV exports:
+
+```bash
+./run.sh --map data/test --names Ganoderma --conf 0.001 --iou 0.7
+```
 
 The model's input size, output layout and class count are read from the
 ONNX metadata automatically, so each model's own geometry is applied —
@@ -147,10 +190,16 @@ human-readable labels and eval tables (otherwise it shows `class_0`).
 | `--image PATH` | — | Run inference on a single image (saves `result_<name>.jpg`) |
 | `--model PATH` | `./best.onnx` | ONNX model file |
 | `--names FILE\|LIST` | COCO names if 80 classes, else `class_N` | Class names: a `.txt` file (one per line) or comma-separated list (e.g. `--names Ganoderma`) |
-| `--conf FLOAT` | `0.25` | Confidence threshold |
-| `--iou FLOAT` | `0.50` | NMS IoU threshold |
-| `--map [DATADIR]` | `data/valid` | Run mAP evaluation on one image dataset (report saved as `eval_report_<dataset>.txt`) |
-| `--classes N` | from ONNX | Number of model classes (auto-detected; can override with `--map`) |
+| `--conf FLOAT` | `0.25` (video) / `0.001` (eval) | Confidence threshold |
+| `--iou FLOAT` | `0.50` (video) / `0.70` (eval) | NMS IoU threshold |
+| `--eval` | — | Static labeled-image evaluation mode (saves `predictions.csv` etc. and runs `evaluate_metrics.py`) |
+| `--images DIR` | — | Test images directory (implies `--eval`) |
+| `--labels DIR` | `../labels` next to images | YOLO txt labels directory |
+| `--out DIR` | script directory | Output dir for predictions.csv, reports, CSVs |
+| `--max-det N` | `300` | Max detections kept per image (evaluation) |
+| `--warmup N` | `5` | Warm-up images excluded from timing stats |
+| `--map [DATADIR]` | `data/valid` | Legacy: evaluate a dataset dir containing `images/` + `labels/` (report saved as `eval_report_<dataset>.txt`) |
+| `--classes N` | from ONNX | Number of model classes (auto-detected; can override with `--eval`/`--map`) |
 | `--no-show` | off | Disable display window (benchmark mode) |
 | `--help` | | Show usage |
 
