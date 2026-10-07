@@ -17,6 +17,8 @@ static PreprocessResult preprocessImpl(const cv::Mat& bgr) {
     int dw = IMAGE_SIZE - nw, dh = IMAGE_SIZE - nh;
     r.padLeft = dw / 2;
     r.padTop  = dh / 2;
+    r.resizedW = nw;   // exact resize target size — used for precise
+    r.resizedH = nh;   // letterbox reversal in evaluation mode
 
     cv::Mat padded;
     cv::copyMakeBorder(resized, padded, r.padTop, dh - r.padTop,

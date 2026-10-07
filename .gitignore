@@ -1,5 +1,6 @@
+# Build output
 build/
-data/
+results/
 *.o
 *.so
 *.a
@@ -8,6 +9,30 @@ CMakeFiles/
 CMakeCache.txt
 cmake_install.cmake
 compile_commands.json
+
+# Generated evaluation / benchmark outputs
+report.txt
+eval_report_*.txt
+predictions.csv
+evaluation_results.csv
+eval_config.csv
+image_sizes.csv
+evaluated_images.txt
+
+# Dataset (place train/valid/test splits here; not published)
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Editors / OS
 .vscode/
 .idea/
+*.swp
+*~
+.DS_Store
+
+# Logs
 *.log

@@ -352,3 +352,18 @@ bool runInference(const std::vector<float>& inputData,
     g_inTensor.v1.clientBuf.data = nullptr;
     return true;
 }
+
+bool getModelShapes(uint32_t inDims[4], uint32_t& inRank,
+                    uint32_t boxDims[4], uint32_t& boxRank,
+                    uint32_t scrDims[4], uint32_t& scrRank) {
+    if (!g_inOK || !g_boxOK || !g_scrOK) return false;
+    inRank = g_inInfo.rank;
+    boxRank = g_boxInfo.rank;
+    scrRank = g_scrInfo.rank;
+    for (int d = 0; d < 4; d++) {
+        inDims[d]  = g_inInfo.dims[d];
+        boxDims[d] = g_boxInfo.dims[d];
+        scrDims[d] = g_scrInfo.dims[d];
+    }
+    return true;
+}

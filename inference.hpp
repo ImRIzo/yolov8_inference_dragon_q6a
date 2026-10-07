@@ -49,3 +49,20 @@ bool loadModel(const std::string& binPath, const std::string& cfgGraphName,
 bool runInference(const std::vector<float>& inputData,
                   uint8_t*& outBoxBuf, uint32_t boxDims[4],
                   uint8_t*& outScrBuf, uint32_t scrDims[4]);
+
+/**
+ * Query the input/output tensor dimensions of the loaded model.
+ * Used by the evaluation mode to validate the model I/O layout and to
+ * print it for reproducibility.
+ *
+ * @param inDims   [out] input tensor dimensions (e.g. 1x3x640x640)
+ * @param inRank   [out] input tensor rank
+ * @param boxDims  [out] boxes output tensor dimensions (e.g. 1x4x8400)
+ * @param boxRank  [out] boxes output tensor rank
+ * @param scrDims  [out] scores output tensor dimensions (e.g. 1xNCx8400)
+ * @param scrRank  [out] scores output tensor rank
+ * @returns true if a model has been loaded and tensor info is available
+ */
+bool getModelShapes(uint32_t inDims[4], uint32_t& inRank,
+                    uint32_t boxDims[4], uint32_t& boxRank,
+                    uint32_t scrDims[4], uint32_t& scrRank);

@@ -121,9 +121,14 @@ int main(int argc, char** argv) {
     float confTh = DEFAULT_CONF, iouTh = DEFAULT_IOU;
     bool showOutput = true;
     bool confGiven = false, iouGiven = false;
-    bool evalMode = false;                    // --map: mAP evaluation mode
-    std::string evalDataDir = "data/valid";   // dataset for --map
+    bool evalMode = false;                    // static labeled-image evaluation mode
+    std::string evalDataDir = "data/valid";   // dataset dir for legacy --map
+    std::string imagesDir, labelsDir;         // explicit --images / --labels dirs
     int numClasses = 1;
+    int maxDet = 300;                         // evaluation max detections per image
+    int warmupFrames = 5;                     // warm-up inferences before timing
+    std::string outDir;                       // output dir (default: exe dir)
+    bool autoPython = true;                   // auto-run evaluate_metrics.py
 
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "--video")  && i+1 < argc) videoPath = argv[++i];
@@ -132,6 +137,13 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--conf")   && i+1 < argc) { confTh    = strtof(argv[++i], nullptr); confGiven = true; }
         else if (!strcmp(argv[i], "--iou")    && i+1 < argc) { iouTh     = strtof(argv[++i], nullptr); iouGiven  = true; }
         else if (!strcmp(argv[i], "--classes") && i+1 < argc) numClasses = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--max-det") && i+1 < argc) maxDet     = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--warmup")  && i+1 < argc) warmupFrames = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--images")  && i+1 < argc) imagesDir  = argv[++i];
+        else if (!strcmp(argv[i], "--labels")  && i+1 < argc) labelsDir  = argv[++i];
+        else if (!strcmp(argv[i], "--out")     && i+1 < argc) outDir     = argv[++i];
+        else if (!strcmp(argv[i], "--eval"))                  evalMode = true;
+        else if (!strcmp(argv[i], "--no-python-eval"))        autoPython = false;
         else if (!strcmp(argv[i], "--map")) {
             evalMode = true;
             if (i + 1 < argc && argv[i + 1][0] != '-') evalDataDir = argv[++i];
@@ -140,20 +152,33 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--help")) {
             printf("Usage: %s [--video PATH] [--rtsp URL] [--lib DIR] [--conf FLOAT] [--iou FLOAT]\n"
                    "             [--no-show] [--map [DATADIR]] [--classes N] [--help]\n"
+                   "             [--eval --images DIR --labels DIR] [--max-det N] [--warmup N] [--out DIR]\n"
                    "\n"
-                   "  RTSP example:\n"
+                   "  Video file:\n"
+                   "    %s --video test_video.mp4\n"
+                   "  RTSP stream:\n"
                    "    %s --rtsp rtsp://192.168.1.100:8554/stream\n"
                    "\n"
-                   "  mAP evaluation on image data (YOLO labels):\n"
-                   "    %s --map data/valid\n"
-                   "    %s --map data/test --classes 1 --conf 0.001 --iou 0.7\n"
-                   "  (dataset folder must contain images/ and labels/)\n",
-                   argv[0], argv[0], argv[0], argv[0]);
+                   "  Static image evaluation (labeled test images, YOLO txt labels):\n"
+                   "    %s --eval --images data/test/images --labels data/test/labels --no-show\n"
+                   "    %s --eval --images data/test/images   (labels dir defaults to ../labels)\n"
+                   "  Evaluation defaults (Ultralytics val.py): conf 0.001, NMS IoU 0.70, max det 300.\n"
+                   "  Raw detections are saved to <outdir>/predictions.csv; Ultralytics-exact metrics\n"
+                   "  are computed by evaluate_metrics.py and saved to <outdir>/evaluation_results.csv.\n"
+                   "\n"
+                   "  Legacy mAP dataset mode (images/ + labels/ inside DATADIR):\n"
+                   "    %s --map data/test --classes 1 --conf 0.001 --iou 0.7\n",
+                   argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
         }
     }
 
+    // --images implies evaluation mode
+    if (!imagesDir.empty()) evalMode = true;
+
     if (evalMode)
-        printf("\n  Lib:        %s\n  Eval data:  %s\n\n", libDir.c_str(), evalDataDir.c_str());
+        printf("\n  Lib:         %s\n  Images dir:  %s\n  Labels dir:  %s\n\n",
+               libDir.c_str(), imagesDir.empty() ? evalDataDir.c_str() : imagesDir.c_str(),
+               labelsDir.empty() ? "(default)" : labelsDir.c_str());
     else
         printf("\n  Video:  %s\n  Lib:    %s\n  Conf:   %.2f  IoU: %.2f\n\n",
                videoPath.c_str(), libDir.c_str(), confTh, iouTh);
@@ -181,22 +206,38 @@ int main(int argc, char** argv) {
         qnnCleanup(); return 1;
     }
 
-    // ── mAP evaluation mode (--map) ───────────────────────────────────────
+    // ── Static labeled-image evaluation mode (--eval / --images / --map) ──
     if (evalMode) {
-        // Ultralytics val.py defaults unless the user overrides via --conf/--iou
+        // Ultralytics val.py defaults unless the user overrides via --conf/--iou.
+        // (The live video demo keeps its own 0.25 / 0.50 thresholds.)
         if (!confGiven) confTh = 0.001f;
         if (!iouGiven)  iouTh  = 0.7f;
         EvalOptions eo;
-        eo.dataDir    = evalDataDir;
-        eo.numClasses = numClasses;
-        eo.confThresh = confTh;
-        eo.iouThresh  = iouTh;
-        eo.maxDet     = 300;
-        std::string dsName = evalDataDir;
-        size_t slash = dsName.rfind('/');
-        if (slash != std::string::npos) dsName = dsName.substr(slash + 1);
-        eo.reportPath = exeDir + "eval_report_" + dsName + ".txt";
-        bool ok = runEvaluation(eo, boxScale, boxOffset, scrScale, scrOffset, binPath);
+        eo.imagesDir    = imagesDir;
+        eo.labelsDir    = labelsDir;
+        eo.dataDir      = imagesDir.empty() ? evalDataDir : "";   // legacy --map
+        eo.outDir       = outDir.empty() ? exeDir : outDir;
+        eo.modelPath    = binPath;
+        eo.runtimeName  = "INT8 QNN HTP NPU (QCS6490)";
+        eo.numClasses   = numClasses;
+        eo.confThresh   = confTh;
+        eo.iouThresh    = iouTh;
+        eo.maxDet       = maxDet;
+        eo.warmupFrames = warmupFrames;
+        eo.autoPython   = autoPython;
+        // Locate evaluate_metrics.py: next to the binary, or in the repo root
+        // when running from the build directory.
+        eo.pythonScript = exeDir + "evaluate_metrics.py";
+        {
+            FILE* f = fopen(eo.pythonScript.c_str(), "r");
+            if (f) fclose(f);
+            else {
+                std::string alt = exeDir + "../evaluate_metrics.py";
+                FILE* f2 = fopen(alt.c_str(), "r");
+                if (f2) { fclose(f2); eo.pythonScript = alt; }
+            }
+        }
+        bool ok = runEvaluation(eo, boxScale, boxOffset, scrScale, scrOffset);
         qnnCleanup();
         return ok ? 0 : 1;
     }

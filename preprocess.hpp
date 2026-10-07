@@ -8,6 +8,8 @@ struct PreprocessResult {
     cv::Mat original;          // original BGR image
     float scale;
     int padLeft, padTop;
+    int resizedW = 0;          // letterboxed size BEFORE padding (exact resize dims)
+    int resizedH = 0;
 };
 
 // Preprocess from file path

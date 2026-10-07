@@ -8,6 +8,13 @@ SYSLIB="/usr/lib/aarch64-linux-gnu"
 MODEL_DIR="$SRC_DIR/../quantized_compiled_model"
 
 echo "=== Assembling $RELEASE ==="
+# Preserve a previously assembled model/ if the source model dir is missing
+# (avoids silently deleting the only copy of the compiled model).
+STASH=""
+if [ ! -d "$MODEL_DIR" ] && [ -d "$RELEASE/model" ]; then
+    STASH="$(mktemp -d)"
+    mv "$RELEASE/model" "$STASH/"
+fi
 rm -rf "$RELEASE"
 mkdir -p "$RELEASE/lib" "$RELEASE/model"
 
@@ -24,8 +31,19 @@ if [ -d "$SRC_DIR/data" ]; then
     cp -r "$SRC_DIR/data" "$RELEASE/"
 fi
 
+# Ultralytics-exact metric evaluator (used by --eval)
+if [ -f "$SRC_DIR/evaluate_metrics.py" ]; then
+    cp "$SRC_DIR/evaluate_metrics.py" "$RELEASE/"
+fi
+
 # Model
-cp "$MODEL_DIR"/*.bin "$MODEL_DIR"/*_config.json "$RELEASE/model/" 2>/dev/null || true
+if [ -d "$MODEL_DIR" ]; then
+    cp "$MODEL_DIR"/*.bin "$MODEL_DIR"/*_config.json "$RELEASE/model/" 2>/dev/null || true
+fi
+if [ -n "$STASH" ]; then
+    cp -r "$STASH/model/." "$RELEASE/model/"
+    rm -rf "$STASH"
+fi
 
 # QNN libs
 for lib in libQnnHtp.so libQnnHtpV68Stub.so libQnnHtpV68Skel.so \
